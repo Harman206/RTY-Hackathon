@@ -118,11 +118,75 @@ See [RULES.md](RULES.md) for the full list.
 
 ## Your project
 
-_Replace this section with your project README:_
-- **Team:**
-- **Track:**
-- **Problem:** who faces it and why it happens
-- **What we built:** the core workflow
-- **The hardest part:** how we solved it
-- **How to run it:**
-- **Demo / screenshots:**
+### AI Compliance Engine
+
+Paste in a new regulation and a JSON snapshot of how the company is set up today. The engine lists every gap, each tied to a verbatim quote from the regulation, and writes a formal, audit-ready compliance log.
+
+- **Team:** _TODO_
+- **Track:** _TODO_ (`area-of-expertise` fits regulatory compliance)
+- **Problem:** Compliance officers and internal auditors at regulated companies (fintech, health, SaaS handling personal data) have to work out, by hand, what each new or amended regulation means for their current policies and systems. They read dense legal text clause by clause, compare it with retention settings, breach procedures and access reviews spread across teams, and then document the findings in a format an auditor or regulator will accept. It happens because regulations change faster than teams can re-read them. Obligations are buried in prose, and the record of who found what, and when, gets written up after the fact.
+- **What we built:** two pure-Python functions that an API layer imports. `analyze_compliance_gap(regulation_text, company_state)` returns structured, severity-sorted findings (`ANOM-001`…), and `generate_audit_trail(findings)` returns a Markdown audit log with an executive summary, a findings table, remediation plans and a timestamped audit trail.
+- **The hardest part:** making LLM output reliable enough to put in an audit file.
+  - **Schema-constrained output:** JSON-schema structured outputs, then pydantic validation, then up to 3 retries.
+  - **Hardened JSON parsing:** fenced, double-encoded or prose-wrapped JSON is repaired before parsing.
+  - **Grounded excerpts:** every `regulation_excerpt` is matched back to the source text and replaced with an exact substring, so quotes are never invented.
+  - **Dates set by Python:** all timestamps come from Python in UTC. The audit log is rejected if the model writes any date or time that isn't in the input.
+  - **Fallback renderer:** if the model's log fails validation twice, a deterministic renderer produces a valid log anyway.
+  - **Prompt-injection defense:** regulation and company text are treated as untrusted data.
+- **Bring your own key:** every function takes an optional `api_key=`, so each user can run the engine on their own Anthropic key. Without it, the engine uses `ANTHROPIC_API_KEY`.
+
+### Setup and run
+
+Requires Python 3.10+.
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+export ANTHROPIC_API_KEY=...          # or pass api_key= per call
+python ai_engine.py                   # smoke test: 30-day vs 90-day retention example
+pytest -m "not live"                  # offline suite, no key or network needed
+pytest -m live                        # real API: retention gap, compliant state, prompt injection, 20x reliability loop
+```
+
+| Env var | Default | Notes |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | none | Required unless the caller passes `api_key=`. Read at call time and never logged. |
+| `LLM_MODEL` | `claude-sonnet-5-5` | |
+| `LLM_TIMEOUT_SECONDS` | `60` | Per-read timeout. Requests are streamed. |
+| `LLM_EFFORT` | `medium` | `low` to `max`. |
+
+### API
+
+```bash
+uvicorn main:app --reload          # http://127.0.0.1:8000/docs
+```
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/health` | none | `{"status": "ok"}` |
+| GET | `/api/system-state` | none | the mock company profile (`mock_db.py`) |
+| POST | `/api/analyze-regulation` | `{"text": "...", "company_state": {...}?}` | list of anomalies |
+| POST | `/api/generate-audit` | `{"anomalies": [...]}` or `{"text": "...", "company_state": {...}?}` | `{"anomalies": [...], "markdown": "..."}` |
+
+- Send the user's own key in the optional `X-Anthropic-Api-Key` header.
+- `company_state` defaults to the mock profile.
+- Errors return a `detail.error` code:
+  - **422:** `INVALID_INPUT`, for bad input.
+  - **401:** `LLM_AUTH`, when the key is missing or rejected.
+  - **502:** `LLM_UNAVAILABLE`, when the provider fails.
+
+### Contract for the API layer
+
+```python
+from ai_engine import analyze_compliance_gap, generate_audit_trail, LLMError, LLMConfigError
+
+anomalies = analyze_compliance_gap(regulation_text, company_state_dict, api_key=user_key)  # list[dict]
+markdown  = generate_audit_trail(anomalies, api_key=user_key)                               # str
+```
+
+- Each anomaly has exactly these keys: `id`, `title`, `category`, `severity`, `gap_type`, `regulation_requirement`, `regulation_excerpt`, `current_state`, `gap_description` and `recommended_remediation`. The list is sorted critical → low.
+- Both functions are synchronous. Call them from a plain `def` route, or use `run_in_threadpool`.
+- `ValueError` means bad input (HTTP 400/422).
+- `LLMConfigError` means a missing or rejected key (HTTP 401/500).
+- Any other `LLMError` means the provider failed (HTTP 502).
+- No other exception type escapes.
